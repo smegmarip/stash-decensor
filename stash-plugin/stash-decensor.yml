@@ -2,7 +2,10 @@ name: Decensor
 description: Decensor pixelated videos using AI
 version: 1.0.0
 ui:
+  requires:
+    - CommunityScriptsUILibrary
   javascript:
+    - https://cdn.jsdelivr.net/npm/jquery@3.7.1/dist/jquery.min.js
     - js/stash.js
     - js/api.js
     - js/stash-decensor.js
