@@ -1,0 +1,25 @@
+name: Decensor
+description: Decensor pixelated videos using AI
+version: 1.0.0
+ui:
+  javascript:
+    - js/stash.js
+    - js/api.js
+    - js/stash-decensor.js
+  csp:
+    connect-src:
+      - http://localhost:7030
+      - ws://localhost:7030
+settings:
+  decensorApiUrl:
+    displayName: Decensor API URL
+    description: URL of the decensor API service
+    type: STRING
+  censoredTagId:
+    displayName: Censored Tag ID
+    description: Stash tag ID that marks scenes as censored
+    type: STRING
+  decensoredTagId:
+    displayName: Decensored Tag ID
+    description: Stash tag ID to apply after decensoring
+    type: STRING
