@@ -13,7 +13,7 @@ ui:
 settings:
   decensorApiUrl:
     displayName: Decensor API URL
-    description: URL of the decensor API service
+    description: URL of the decensor API service (e.g. http://localhost:7030)
     type: STRING
   censoredTagId:
     displayName: Censored Tag ID
