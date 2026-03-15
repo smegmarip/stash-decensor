@@ -1,0 +1,72 @@
+services:
+  redis:
+    image: redis:7-alpine
+    command: redis-server --maxmemory 512mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    networks:
+      - decensor_network
+    restart: unless-stopped
+
+  decensor-api:
+    build: ./decensor-api
+    ports:
+      - "${API_PORT:-7030}:5030"
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - STASH_URL=${STASH_URL}
+      - STASH_API_KEY=${STASH_API_KEY}
+      - CENSORED_TAG_ID=${CENSORED_TAG_ID:-}
+      - DECENSORED_TAG_ID=${DECENSORED_TAG_ID:-}
+      - ENCODING_PRESET=${ENCODING_PRESET:-hevc-nvidia-gpu-hq}
+      - MAX_CLIP_LENGTH=${MAX_CLIP_LENGTH:-180}
+      - FP16=${FP16:-true}
+      - WORKER_CONCURRENCY=${WORKER_CONCURRENCY:-1}
+      - JOB_TIMEOUT=${JOB_TIMEOUT:-7200}
+      - CACHE_TTL=${CACHE_TTL:-86400}
+    volumes:
+      - ${MEDIA_PATH}:/data:rw
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - decensor_network
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+  decensor-worker:
+    image: ladaapp/lada:latest
+    container_name: decensor-worker
+    runtime: nvidia
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu, video]
+    volumes:
+      - ${MEDIA_PATH}:/data:rw
+    networks:
+      - decensor_network
+    entrypoint: ["tail", "-f", "/dev/null"]
+    restart: unless-stopped
+
+  jobs-viewer:
+    build: ./jobs-viewer
+    ports:
+      - "${UI_PORT:-7031}:5031"
+    environment:
+      - DECENSOR_API_URL=http://decensor-api:5030
+      - REDIS_URL=redis://redis:6379/0
+    networks:
+      - decensor_network
+    depends_on:
+      - decensor-api
+    restart: unless-stopped
+
+networks:
+  decensor_network:
+    name: ${DOCKER_NETWORK:-stash-decensor-network}
+
+volumes:
+  redis_data:
