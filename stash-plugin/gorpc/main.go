@@ -1,0 +1,477 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/url"
+	"time"
+
+	graphql "github.com/hasura/go-graphql-client"
+	"github.com/stashapp/stash/pkg/plugin/common"
+	"github.com/stashapp/stash/pkg/plugin/common/log"
+	"github.com/stashapp/stash/pkg/plugin/util"
+)
+
+func main() {
+	err := common.ServePlugin(&decensorAPI{})
+	if err != nil {
+		panic(err)
+	}
+}
+
+type decensorAPI struct {
+	stopping         bool
+	serverConnection common.StashServerConnection
+	graphqlClient    *graphql.Client
+}
+
+// JobRequest represents the request to submit a decensor job
+type JobRequest struct {
+	VideoPath      string `json:"video_path"`
+	SceneID        string `json:"scene_id"`
+	EncodingPreset string `json:"encoding_preset,omitempty"`
+	MaxClipLength  int    `json:"max_clip_length,omitempty"`
+}
+
+// JobResponse represents the response from submitting a job
+type JobResponse struct {
+	JobID       string   `json:"job_id"`
+	Status      string   `json:"status"`
+	Progress    float64  `json:"progress"`
+	Error       *string  `json:"error"`
+	Result      *Result  `json:"result"`
+}
+
+// Result represents the job result
+type Result struct {
+	OutputPath            string  `json:"output_path"`
+	ProcessingTimeSeconds float64 `json:"processing_time_seconds"`
+}
+
+// resolveServiceURL resolves the service URL with proper DNS lookup
+func resolveServiceURL(configuredURL string) string {
+	const defaultContainerName = "decensor-api"
+	const defaultPort = "5030"
+	const defaultScheme = "http"
+	var hardcodedFallback = fmt.Sprintf("%s://%s:%s", defaultScheme, defaultContainerName, defaultPort)
+
+	if configuredURL == "" {
+		configuredURL = hardcodedFallback
+	}
+
+	parsedURL, err := url.Parse(configuredURL)
+	if err != nil {
+		log.Warnf("Failed to parse service URL '%s': %v, using fallback", configuredURL, err)
+		return hardcodedFallback
+	}
+
+	hostname := parsedURL.Hostname()
+	port := parsedURL.Port()
+	scheme := parsedURL.Scheme
+
+	if scheme == "" {
+		scheme = defaultScheme
+	}
+
+	if port == "" {
+		port = defaultPort
+	}
+
+	if hostname == "localhost" || hostname == "127.0.0.1" {
+		resolvedURL := fmt.Sprintf("%s://%s:%s", scheme, hostname, port)
+		log.Infof("Using localhost service URL: %s", resolvedURL)
+		return resolvedURL
+	}
+
+	if net.ParseIP(hostname) != nil {
+		resolvedURL := fmt.Sprintf("%s://%s:%s", scheme, hostname, port)
+		log.Infof("Using IP-based service URL: %s", resolvedURL)
+		return resolvedURL
+	}
+
+	log.Infof("Resolving hostname via DNS: %s", hostname)
+	addrs, err := net.LookupIP(hostname)
+	if err != nil {
+		log.Warnf("DNS lookup failed for '%s': %v, using hostname as-is", hostname, err)
+		resolvedURL := fmt.Sprintf("%s://%s:%s", scheme, hostname, port)
+		return resolvedURL
+	}
+
+	if len(addrs) == 0 {
+		log.Warnf("No IP addresses found for hostname '%s', using hostname as-is", hostname)
+		resolvedURL := fmt.Sprintf("%s://%s:%s", scheme, hostname, port)
+		return resolvedURL
+	}
+
+	resolvedIP := addrs[0].String()
+	resolvedURL := fmt.Sprintf("%s://%s:%s", scheme, resolvedIP, port)
+	log.Infof("Resolved '%s' to %s", hostname, resolvedURL)
+	return resolvedURL
+}
+
+func (a *decensorAPI) Stop(input struct{}, output *bool) error {
+	log.Info("Stopping decensor plugin...")
+	a.stopping = true
+	*output = true
+	return nil
+}
+
+// Run handles the RPC task execution
+func (a *decensorAPI) Run(input common.PluginInput, output *common.PluginOutput) error {
+	a.serverConnection = input.ServerConnection
+	a.graphqlClient = util.NewClient(input.ServerConnection)
+
+	mode := input.Args.String("mode")
+
+	var err error
+	var outputStr string = "Unknown mode. Plugin did not run."
+
+	switch mode {
+	case "decensor":
+		err = a.decensorScene(input)
+		outputStr = "Decensor job completed successfully"
+	default:
+		err = fmt.Errorf("unknown mode: %s", mode)
+	}
+
+	if err != nil {
+		errStr := err.Error()
+		*output = common.PluginOutput{
+			Error: &errStr,
+		}
+		return nil
+	}
+
+	*output = common.PluginOutput{
+		Output: &outputStr,
+	}
+
+	return nil
+}
+
+// decensorScene submits a decensor job and polls for completion
+func (a *decensorAPI) decensorScene(input common.PluginInput) error {
+	sceneID := input.Args.String("scene_id")
+	videoPath := input.Args.String("video_path")
+	serviceURL := input.Args.String("service_url")
+	censoredTagID := input.Args.String("censored_tag_id")
+	decensoredTagID := input.Args.String("decensored_tag_id")
+
+	if sceneID == "" {
+		return fmt.Errorf("scene_id is required")
+	}
+	if videoPath == "" {
+		return fmt.Errorf("video_path is required")
+	}
+
+	serviceURL = resolveServiceURL(serviceURL)
+
+	log.Infof("Starting decensor job for scene %s: %s", sceneID, videoPath)
+
+	// Submit job to decensor API
+	jobID, err := a.submitJob(serviceURL, videoPath, sceneID)
+	if err != nil {
+		return fmt.Errorf("failed to submit job: %w", err)
+	}
+
+	log.Infof("Decensor job submitted: %s", jobID)
+
+	// Poll for completion
+	result, err := a.pollJobStatus(serviceURL, jobID)
+	if err != nil {
+		return err
+	}
+
+	log.Infof("Decensor job completed, output: %s", result.OutputPath)
+
+	// Scan the output file
+	if err := a.scanPath(result.OutputPath); err != nil {
+		log.Warnf("Failed to trigger metadata scan: %v", err)
+	}
+
+	// Wait for scan to complete
+	time.Sleep(3 * time.Second)
+
+	// Find the new scene
+	newSceneID, err := a.findSceneByPath(result.OutputPath)
+	if err != nil {
+		log.Warnf("Failed to find new scene: %v", err)
+	} else if newSceneID != "" && newSceneID != sceneID {
+		// Merge scenes
+		log.Infof("Merging scene %s into %s", newSceneID, sceneID)
+		if err := a.mergeScenes([]string{newSceneID}, sceneID); err != nil {
+			log.Warnf("Failed to merge scenes: %v", err)
+		}
+	}
+
+	// Update tags
+	if decensoredTagID != "" {
+		if err := a.updateSceneTags(sceneID, censoredTagID, decensoredTagID); err != nil {
+			log.Warnf("Failed to update tags: %v", err)
+		}
+	}
+
+	return nil
+}
+
+func (a *decensorAPI) submitJob(serviceURL, videoPath, sceneID string) (string, error) {
+	url := fmt.Sprintf("%s/decensor/jobs", serviceURL)
+
+	req := JobRequest{
+		VideoPath: videoPath,
+		SceneID:   sceneID,
+	}
+
+	reqBody, err := json.Marshal(req)
+	if err != nil {
+		return "", err
+	}
+
+	resp, err := http.Post(url, "application/json", bytes.NewBuffer(reqBody))
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+	}
+
+	var jobResp JobResponse
+	if err := json.NewDecoder(resp.Body).Decode(&jobResp); err != nil {
+		return "", err
+	}
+
+	return jobResp.JobID, nil
+}
+
+func (a *decensorAPI) pollJobStatus(serviceURL, jobID string) (*Result, error) {
+	url := fmt.Sprintf("%s/decensor/jobs/%s/status", serviceURL, jobID)
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		if a.stopping {
+			return nil, fmt.Errorf("task interrupted")
+		}
+
+		select {
+		case <-ticker.C:
+			resp, err := http.Get(url)
+			if err != nil {
+				return nil, fmt.Errorf("failed to get job status: %w", err)
+			}
+
+			var status JobResponse
+			if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
+				resp.Body.Close()
+				return nil, fmt.Errorf("failed to decode status: %w", err)
+			}
+			resp.Body.Close()
+
+			log.Progress(status.Progress)
+			log.Tracef("Job status: %s (%.0f%%)", status.Status, status.Progress*100)
+
+			switch status.Status {
+			case "completed":
+				if status.Result == nil {
+					return nil, fmt.Errorf("job completed but no result")
+				}
+				return status.Result, nil
+
+			case "failed", "cancelled":
+				if status.Error != nil {
+					return nil, fmt.Errorf("job %s: %s", status.Status, *status.Error)
+				}
+				return nil, fmt.Errorf("job %s", status.Status)
+
+			case "queued", "processing":
+				continue
+
+			default:
+				return nil, fmt.Errorf("unknown job status: %s", status.Status)
+			}
+		}
+	}
+}
+
+func (a *decensorAPI) scanPath(path string) error {
+	ctx := context.Background()
+
+	var mutation struct {
+		MetadataScan graphql.String `graphql:"metadataScan(input: $input)"`
+	}
+
+	type ScanMetadataInput struct {
+		Paths []string `json:"paths"`
+	}
+
+	variables := map[string]interface{}{
+		"input": ScanMetadataInput{Paths: []string{path}},
+	}
+
+	err := a.graphqlClient.Mutate(ctx, &mutation, variables)
+	if err != nil {
+		return fmt.Errorf("metadata scan mutation failed: %w", err)
+	}
+
+	log.Infof("Triggered metadata scan for: %s", path)
+	return nil
+}
+
+func (a *decensorAPI) findSceneByPath(path string) (string, error) {
+	ctx := context.Background()
+
+	var query struct {
+		FindScenes struct {
+			Scenes []struct {
+				ID graphql.ID `graphql:"id"`
+			} `graphql:"scenes"`
+		} `graphql:"findScenes(filter: $filter, scene_filter: $scene_filter)"`
+	}
+
+	type FindFilterType struct {
+		PerPage *graphql.Int `json:"per_page"`
+	}
+
+	type StringCriterionInput struct {
+		Value    graphql.String `json:"value"`
+		Modifier graphql.String `json:"modifier"`
+	}
+
+	type SceneFilterType struct {
+		Path *StringCriterionInput `json:"path"`
+	}
+
+	perPage := graphql.Int(1)
+	variables := map[string]interface{}{
+		"filter": &FindFilterType{PerPage: &perPage},
+		"scene_filter": &SceneFilterType{
+			Path: &StringCriterionInput{
+				Value:    graphql.String(path),
+				Modifier: "EQUALS",
+			},
+		},
+	}
+
+	err := a.graphqlClient.Query(ctx, &query, variables)
+	if err != nil {
+		return "", fmt.Errorf("find scenes query failed: %w", err)
+	}
+
+	if len(query.FindScenes.Scenes) > 0 {
+		return string(query.FindScenes.Scenes[0].ID), nil
+	}
+
+	return "", nil
+}
+
+func (a *decensorAPI) mergeScenes(sourceIDs []string, destID string) error {
+	ctx := context.Background()
+
+	var mutation struct {
+		SceneMerge struct {
+			ID graphql.ID `graphql:"id"`
+		} `graphql:"sceneMerge(input: $input)"`
+	}
+
+	sourceGraphqlIDs := make([]graphql.ID, len(sourceIDs))
+	for i, id := range sourceIDs {
+		sourceGraphqlIDs[i] = graphql.ID(id)
+	}
+
+	type SceneMergeInput struct {
+		Source      []graphql.ID `json:"source"`
+		Destination graphql.ID   `json:"destination"`
+	}
+
+	variables := map[string]interface{}{
+		"input": SceneMergeInput{
+			Source:      sourceGraphqlIDs,
+			Destination: graphql.ID(destID),
+		},
+	}
+
+	err := a.graphqlClient.Mutate(ctx, &mutation, variables)
+	if err != nil {
+		return fmt.Errorf("scene merge mutation failed: %w", err)
+	}
+
+	log.Infof("Scenes merged successfully")
+	return nil
+}
+
+func (a *decensorAPI) updateSceneTags(sceneID, censoredTagID, decensoredTagID string) error {
+	ctx := context.Background()
+
+	// First get current tags
+	var query struct {
+		FindScene struct {
+			Tags []struct {
+				ID graphql.ID `graphql:"id"`
+			} `graphql:"tags"`
+		} `graphql:"findScene(id: $id)"`
+	}
+
+	queryVars := map[string]interface{}{
+		"id": graphql.ID(sceneID),
+	}
+
+	err := a.graphqlClient.Query(ctx, &query, queryVars)
+	if err != nil {
+		return fmt.Errorf("failed to get scene tags: %w", err)
+	}
+
+	// Build new tag list
+	newTagIDs := []graphql.ID{}
+	for _, tag := range query.FindScene.Tags {
+		if string(tag.ID) != censoredTagID {
+			newTagIDs = append(newTagIDs, tag.ID)
+		}
+	}
+
+	// Add decensored tag if not already present
+	hasDecensoredTag := false
+	for _, id := range newTagIDs {
+		if string(id) == decensoredTagID {
+			hasDecensoredTag = true
+			break
+		}
+	}
+	if !hasDecensoredTag {
+		newTagIDs = append(newTagIDs, graphql.ID(decensoredTagID))
+	}
+
+	// Update scene
+	var mutation struct {
+		SceneUpdate struct {
+			ID graphql.ID `graphql:"id"`
+		} `graphql:"sceneUpdate(input: $input)"`
+	}
+
+	type SceneUpdateInput struct {
+		ID     graphql.ID   `json:"id"`
+		TagIDs []graphql.ID `json:"tag_ids"`
+	}
+
+	mutationVars := map[string]interface{}{
+		"input": SceneUpdateInput{
+			ID:     graphql.ID(sceneID),
+			TagIDs: newTagIDs,
+		},
+	}
+
+	err = a.graphqlClient.Mutate(ctx, &mutation, mutationVars)
+	if err != nil {
+		return fmt.Errorf("scene update mutation failed: %w", err)
+	}
+
+	log.Infof("Scene tags updated")
+	return nil
+}

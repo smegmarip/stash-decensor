@@ -2,12 +2,12 @@
   'use strict';
 
   const PLUGIN_ID = 'stash-decensor';
-  const { StashDecensorStash: Stash, StashDecensorApi: Api } = window;
+  const csLib = window.csLib;
+  const { getPluginConfig, runPluginTask, getJobStatus, getScene } = window.stashFunctions;
 
   const api = window.PluginApi;
   const React = api.React;
   const { Button } = api.libraries.Bootstrap;
-  const csLib = window.csLib;
 
   // Magic wand / restore icon
   const decensorIconSvg = `
@@ -18,38 +18,31 @@
 </svg>`;
 
   let config = {
-    decensorApiUrl: 'http://localhost:7030',
+    decensorApiUrl: '',
     censoredTagId: '',
     decensoredTagId: '',
   };
 
   let activeJobs = new Map();
 
+  const toastTemplate = {
+    success: `<div class="toast fade show success" role="alert"><div class="d-flex"><div class="toast-body flex-grow-1">`,
+    error: `<div class="toast fade show danger" role="alert"><div class="d-flex"><div class="toast-body flex-grow-1">`,
+    bottom: `</div><button type="button" class="close ml-2 mb-1 mr-2" data-dismiss="toast" aria-label="Close"><span aria-hidden="true">&times;</span></button></div></div>`,
+  };
+
   async function loadConfig() {
     try {
-      const pluginConfig = await Stash.getPluginConfig(PLUGIN_ID);
-      if (pluginConfig.decensorApiUrl) {
-        config.decensorApiUrl = pluginConfig.decensorApiUrl;
-        Api.setApiUrl(config.decensorApiUrl);
-      }
-      if (pluginConfig.censoredTagId) {
-        config.censoredTagId = pluginConfig.censoredTagId;
-      }
-      if (pluginConfig.decensoredTagId) {
-        config.decensoredTagId = pluginConfig.decensoredTagId;
-      }
+      const pluginConfig = await getPluginConfig(PLUGIN_ID);
+      config.decensorApiUrl = pluginConfig?.decensorApiUrl || '';
+      config.censoredTagId = pluginConfig?.censoredTagId || '';
+      config.decensoredTagId = pluginConfig?.decensoredTagId || '';
     } catch (e) {
       console.warn('[Decensor] Failed to load plugin config:', e);
     }
   }
 
   function showToast(message, type = 'success') {
-    const toastTemplate = {
-      success: `<div class="toast fade show success" role="alert"><div class="d-flex"><div class="toast-body flex-grow-1">`,
-      error: `<div class="toast fade show danger" role="alert"><div class="d-flex"><div class="toast-body flex-grow-1">`,
-      bottom: `</div><button type="button" class="close ml-2 mb-1 mr-2" data-dismiss="toast" aria-label="Close"><span aria-hidden="true">&times;</span></button></div></div>`,
-    };
-
     const template = type === 'error' ? toastTemplate.error : toastTemplate.success;
     const $toast = $(template + message + toastTemplate.bottom);
     const rmToast = () => {
@@ -84,93 +77,98 @@
     }
 
     try {
-      const scene = await Stash.getScene(sceneId);
+      const scene = await getScene(sceneId);
       if (!scene || !scene.files || scene.files.length === 0) {
         showToast('Scene has no video files', 'error');
         return;
       }
 
       const videoPath = scene.files[0].path;
-      showToast(`Starting decensor job for: ${videoPath.split('/').pop()}`);
+      const sceneTitle = scene.title || `Scene ${sceneId}`;
 
-      const job = await Api.submitJob(videoPath, sceneId);
-      activeJobs.set(sceneId, job.job_id);
+      showToast(`Starting decensor job for: ${sceneTitle}`);
 
-      showToast(`Job queued: ${job.job_id.slice(0, 8)}...`);
+      // Run the plugin task via RPC
+      const result = await runPluginTask(
+        PLUGIN_ID,
+        'Decensor Scene',
+        [
+          { key: 'mode', value: { str: 'decensor' } },
+          { key: 'scene_id', value: { str: sceneId } },
+          { key: 'video_path', value: { str: videoPath } },
+          { key: 'service_url', value: { str: config.decensorApiUrl } },
+          { key: 'censored_tag_id', value: { str: config.censoredTagId } },
+          { key: 'decensored_tag_id', value: { str: config.decensoredTagId } },
+        ]
+      );
 
-      processJob(sceneId, job.job_id, scene);
+      if (!result || !result.runPluginTask) {
+        showToast('Failed to start decensor task', 'error');
+        return;
+      }
+
+      const jobId = result.runPluginTask;
+      activeJobs.set(sceneId, jobId);
+
+      showToast(`Job queued: ${jobId}`);
+
+      // Poll for job completion
+      await pollJobCompletion(sceneId, jobId);
 
     } catch (e) {
       console.error('[Decensor] Error starting job:', e);
       showToast(`Failed to start job: ${e.message}`, 'error');
-    }
-  }
-
-  async function processJob(sceneId, jobId, originalScene) {
-    try {
-      const completedJob = await Api.pollJobUntilComplete(jobId, {
-        pollInterval: 2000,
-        maxWaitMs: 7200000,
-        onProgress: (job) => {
-          if (job.status === 'processing') {
-            const percent = Math.round(job.progress * 100);
-            updateButtonProgress(sceneId, percent);
-          }
-        },
-      });
-
-      showToast('Decensoring completed. Scanning output file...');
-
-      if (completedJob.result && completedJob.result.output_path) {
-        await handleJobCompletion(sceneId, originalScene, completedJob.result.output_path);
-      }
-
-    } catch (e) {
-      console.error('[Decensor] Job failed:', e);
-      showToast(`Decensor job failed: ${e.message}`, 'error');
-    } finally {
       activeJobs.delete(sceneId);
       resetButton(sceneId);
     }
   }
 
-  async function handleJobCompletion(sceneId, originalScene, outputPath) {
-    try {
-      const scanJobId = await Stash.scanPath(outputPath);
-      showToast('Scanning decensored file...');
+  async function pollJobCompletion(sceneId, jobId) {
+    const pollInterval = 2000;
+    const maxWaitMs = 7200000;
+    const startTime = Date.now();
 
-      await Stash.waitForJob(scanJobId, 120000);
-
-      await new Promise(resolve => setTimeout(resolve, 2000));
-
-      const newScene = await Stash.findSceneByPath(outputPath);
-
-      if (newScene && newScene.id !== sceneId) {
-        showToast('Merging scenes...');
-
-        await Stash.mergeScenes([newScene.id], sceneId);
-
-        showToast('Scenes merged successfully');
+    const poll = async () => {
+      if (Date.now() - startTime > maxWaitMs) {
+        showToast('Job timed out', 'error');
+        activeJobs.delete(sceneId);
+        resetButton(sceneId);
+        return;
       }
 
-      if (config.decensoredTagId) {
-        const currentTags = originalScene.tags.map(t => t.id);
-        const newTags = currentTags.filter(id => id !== config.censoredTagId);
+      try {
+        const result = await getJobStatus(jobId);
+        const status = result?.findJob?.status;
+        const progress = result?.findJob?.progress;
 
-        if (!newTags.includes(config.decensoredTagId)) {
-          newTags.push(config.decensoredTagId);
+        if (typeof progress === 'number' && progress >= 0) {
+          updateButtonProgress(sceneId, Math.round(progress * 100));
         }
 
-        await Stash.updateSceneTags(sceneId, newTags);
-        showToast('Tags updated');
+        if (status === 'FINISHED') {
+          showToast('Decensoring complete!');
+          activeJobs.delete(sceneId);
+          resetButton(sceneId);
+          return;
+        }
+
+        if (status === 'FAILED' || status === 'CANCELLED') {
+          showToast(`Job ${status.toLowerCase()}`, 'error');
+          activeJobs.delete(sceneId);
+          resetButton(sceneId);
+          return;
+        }
+
+        // Continue polling
+        setTimeout(poll, pollInterval);
+
+      } catch (e) {
+        console.error('[Decensor] Error polling job status:', e);
+        setTimeout(poll, pollInterval);
       }
+    };
 
-      showToast('Decensoring complete!');
-
-    } catch (e) {
-      console.error('[Decensor] Post-processing error:', e);
-      showToast(`Post-processing error: ${e.message}`, 'error');
-    }
+    poll();
   }
 
   function updateButtonProgress(sceneId, percent) {
@@ -211,7 +209,7 @@
     }
 
     try {
-      const scene = await Stash.getScene(sceneId);
+      const scene = await getScene(sceneId);
       if (!scene) return;
 
       const showButton = !config.censoredTagId || sceneHasCensoredTag(scene);
