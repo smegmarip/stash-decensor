@@ -109,7 +109,7 @@ class WorkerService:
         input_path: str,
         output_path: str,
         encoding_preset: str,
-        max_clip_length: int,
+        max_clip_length: Optional[int],
     ) -> bool:
         cmd = [
             "docker", "exec", settings.worker_container,
@@ -117,10 +117,12 @@ class WorkerService:
             "--input", input_path,
             "--output", output_path,
             "--encoding-preset", encoding_preset,
-            "--max-clip-length", str(max_clip_length),
         ]
 
-        if settings.fp16:
+        if max_clip_length is not None:
+            cmd.extend(["--max-clip-length", str(max_clip_length)])
+
+        if settings.fp16 is True:
             cmd.append("--fp16")
 
         process = await asyncio.create_subprocess_exec(

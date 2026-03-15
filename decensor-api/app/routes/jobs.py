@@ -33,7 +33,7 @@ async def create_job(request: JobCreateRequest):
         video_path=request.video_path,
         scene_id=request.scene_id,
         encoding_preset=request.encoding_preset or settings.encoding_preset,
-        max_clip_length=request.max_clip_length or settings.max_clip_length,
+        max_clip_length=request.max_clip_length if request.max_clip_length is not None else settings.max_clip_length,
     )
 
     await queue_service.enqueue_job(job)

@@ -1,3 +1,4 @@
+from typing import Optional
 from pydantic_settings import BaseSettings
 
 
@@ -11,8 +12,8 @@ class Settings(BaseSettings):
     decensored_tag_id: str = ""
 
     encoding_preset: str = "hevc-nvidia-gpu-hq"
-    max_clip_length: int = 180
-    fp16: bool = True
+    max_clip_length: Optional[int] = None
+    fp16: Optional[bool] = None
 
     worker_concurrency: int = 1
     job_timeout: int = 7200

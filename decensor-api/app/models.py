@@ -30,7 +30,7 @@ class Job(BaseModel):
     video_path: str
     scene_id: str
     encoding_preset: str
-    max_clip_length: int
+    max_clip_length: Optional[int] = None
     status: JobStatus = JobStatus.QUEUED
     progress: float = 0.0
     created_at: datetime = Field(default_factory=datetime.utcnow)
@@ -62,7 +62,7 @@ class Job(BaseModel):
             video_path=data["video_path"],
             scene_id=data["scene_id"],
             encoding_preset=data["encoding_preset"],
-            max_clip_length=data["max_clip_length"],
+            max_clip_length=data.get("max_clip_length"),
             status=JobStatus(data["status"]),
             progress=data["progress"],
             created_at=datetime.fromisoformat(data["created_at"]),
