@@ -4,6 +4,19 @@
   const PLUGIN_ID = 'stash-decensor';
   const { StashDecensorStash: Stash, StashDecensorApi: Api } = window;
 
+  const api = window.PluginApi;
+  const React = api.React;
+  const { Button } = api.libraries.Bootstrap;
+  const csLib = window.csLib;
+
+  // Magic wand / restore icon
+  const decensorIconSvg = `
+<svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <path d="M15 4V2M15 16V14M8 9H10M20 9H22M17.8 11.8L19 13M17.8 6.2L19 5M12.2 11.8L11 13M12.2 6.2L11 5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M15 9C15 10.6569 13.6569 12 12 12C10.3431 12 9 10.6569 9 9C9 7.34315 10.3431 6 12 6" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+  <path d="M6 21L3 18L14 7L17 10L6 21Z" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>`;
+
   let config = {
     decensorApiUrl: 'http://localhost:7030',
     censoredTagId: '',
@@ -30,38 +43,26 @@
     }
   }
 
-  function showToast(message, type = 'info') {
-    const toast = document.createElement('div');
-    toast.className = `toast toast-${type}`;
-    toast.style.cssText = `
-      position: fixed;
-      bottom: 20px;
-      right: 20px;
-      padding: 12px 20px;
-      border-radius: 4px;
-      color: white;
-      font-size: 14px;
-      z-index: 10000;
-      max-width: 400px;
-      word-wrap: break-word;
-      animation: slideIn 0.3s ease-out;
-    `;
-
-    const colors = {
-      info: '#3498db',
-      success: '#27ae60',
-      error: '#e74c3c',
-      warning: '#f39c12',
+  function showToast(message, type = 'success') {
+    const toastTemplate = {
+      success: `<div class="toast fade show success" role="alert"><div class="d-flex"><div class="toast-body flex-grow-1">`,
+      error: `<div class="toast fade show danger" role="alert"><div class="d-flex"><div class="toast-body flex-grow-1">`,
+      bottom: `</div><button type="button" class="close ml-2 mb-1 mr-2" data-dismiss="toast" aria-label="Close"><span aria-hidden="true">&times;</span></button></div></div>`,
     };
-    toast.style.backgroundColor = colors[type] || colors.info;
 
-    toast.textContent = message;
-    document.body.appendChild(toast);
+    const template = type === 'error' ? toastTemplate.error : toastTemplate.success;
+    const $toast = $(template + message + toastTemplate.bottom);
+    const rmToast = () => {
+      const hasSiblings = $toast.siblings().length > 0;
+      $toast.remove();
+      if (!hasSiblings) {
+        $('.toast-container').addClass('hidden');
+      }
+    };
 
-    setTimeout(() => {
-      toast.style.animation = 'fadeOut 0.3s ease-out';
-      setTimeout(() => toast.remove(), 300);
-    }, 5000);
+    $toast.find('button.close').click(rmToast);
+    $('.toast-container').append($toast).removeClass('hidden');
+    setTimeout(rmToast, 5000);
   }
 
   function getSceneIdFromUrl() {
@@ -78,7 +79,7 @@
 
   async function handleDecensorClick(sceneId) {
     if (activeJobs.has(sceneId)) {
-      showToast('A decensor job is already running for this scene', 'warning');
+      showToast('A decensor job is already running for this scene', 'error');
       return;
     }
 
@@ -90,12 +91,12 @@
       }
 
       const videoPath = scene.files[0].path;
-      showToast(`Starting decensor job for: ${videoPath.split('/').pop()}`, 'info');
+      showToast(`Starting decensor job for: ${videoPath.split('/').pop()}`);
 
       const job = await Api.submitJob(videoPath, sceneId);
       activeJobs.set(sceneId, job.job_id);
 
-      showToast(`Job queued: ${job.job_id.slice(0, 8)}...`, 'success');
+      showToast(`Job queued: ${job.job_id.slice(0, 8)}...`);
 
       processJob(sceneId, job.job_id, scene);
 
@@ -118,7 +119,7 @@
         },
       });
 
-      showToast('Decensoring completed. Scanning output file...', 'success');
+      showToast('Decensoring completed. Scanning output file...');
 
       if (completedJob.result && completedJob.result.output_path) {
         await handleJobCompletion(sceneId, originalScene, completedJob.result.output_path);
@@ -136,7 +137,7 @@
   async function handleJobCompletion(sceneId, originalScene, outputPath) {
     try {
       const scanJobId = await Stash.scanPath(outputPath);
-      showToast('Scanning decensored file...', 'info');
+      showToast('Scanning decensored file...');
 
       await Stash.waitForJob(scanJobId, 120000);
 
@@ -145,11 +146,11 @@
       const newScene = await Stash.findSceneByPath(outputPath);
 
       if (newScene && newScene.id !== sceneId) {
-        showToast('Merging scenes...', 'info');
+        showToast('Merging scenes...');
 
         await Stash.mergeScenes([newScene.id], sceneId);
 
-        showToast('Scenes merged successfully', 'success');
+        showToast('Scenes merged successfully');
       }
 
       if (config.decensoredTagId) {
@@ -161,48 +162,45 @@
         }
 
         await Stash.updateSceneTags(sceneId, newTags);
-        showToast('Tags updated', 'success');
+        showToast('Tags updated');
       }
 
-      showToast('Decensoring complete!', 'success');
+      showToast('Decensoring complete!');
 
     } catch (e) {
       console.error('[Decensor] Post-processing error:', e);
-      showToast(`Post-processing error: ${e.message}`, 'warning');
+      showToast(`Post-processing error: ${e.message}`, 'error');
     }
   }
 
   function updateButtonProgress(sceneId, percent) {
     const button = document.querySelector(`[data-decensor-scene="${sceneId}"]`);
     if (button) {
-      button.textContent = `Decensoring... ${percent}%`;
-      button.disabled = true;
+      button.title = `Decensoring... ${percent}%`;
+      button.style.opacity = '0.6';
+      button.style.pointerEvents = 'none';
     }
   }
 
   function resetButton(sceneId) {
     const button = document.querySelector(`[data-decensor-scene="${sceneId}"]`);
     if (button) {
-      button.textContent = 'Decensor';
-      button.disabled = false;
+      button.title = 'Decensor';
+      button.style.opacity = '1';
+      button.style.pointerEvents = 'auto';
     }
   }
 
-  function createDecensorButton(sceneId) {
-    const button = document.createElement('button');
-    button.className = 'btn btn-primary';
-    button.textContent = 'Decensor';
-    button.setAttribute('data-decensor-scene', sceneId);
-    button.style.cssText = 'margin-left: 8px;';
-
-    button.addEventListener('click', (e) => {
-      e.preventDefault();
-      e.stopPropagation();
-      handleDecensorClick(sceneId);
+  const DecensorButton = ({ sceneId }) => {
+    return React.createElement(Button, {
+      className: 'minimal btn btn-secondary',
+      id: 'decensor-btn',
+      title: 'Decensor',
+      'data-decensor-scene': sceneId,
+      onClick: () => handleDecensorClick(sceneId),
+      dangerouslySetInnerHTML: { __html: decensorIconSvg },
     });
-
-    return button;
-  }
+  };
 
   async function injectButton() {
     const sceneId = getSceneIdFromUrl();
@@ -219,13 +217,16 @@
       const showButton = !config.censoredTagId || sceneHasCensoredTag(scene);
       if (!showButton) return;
 
-      const toolbar = document.querySelector('.scene-toolbar') ||
-                      document.querySelector('.detail-header-buttons') ||
-                      document.querySelector('.scene-tabs');
-
+      const toolbar = document.querySelector('.scene-toolbar .btn-group');
       if (toolbar) {
-        const button = createDecensorButton(sceneId);
-        toolbar.appendChild(button);
+        const container = document.createElement('span');
+        container.className = 'decensor-button';
+        toolbar.appendChild(container);
+
+        api.ReactDOM.render(
+          React.createElement(DecensorButton, { sceneId }),
+          container
+        );
       }
 
     } catch (e) {
@@ -233,41 +234,19 @@
     }
   }
 
-  function init() {
-    loadConfig();
-
-    const style = document.createElement('style');
-    style.textContent = `
-      @keyframes slideIn {
-        from { transform: translateX(100%); opacity: 0; }
-        to { transform: translateX(0); opacity: 1; }
-      }
-      @keyframes fadeOut {
-        from { opacity: 1; }
-        to { opacity: 0; }
-      }
-    `;
-    document.head.appendChild(style);
-
-    let lastUrl = '';
-    const observer = new MutationObserver(() => {
-      if (window.location.href !== lastUrl) {
-        lastUrl = window.location.href;
-        setTimeout(injectButton, 500);
-      }
-    });
-
-    observer.observe(document.body, {
-      childList: true,
-      subtree: true,
-    });
-
-    setTimeout(injectButton, 1000);
+  function cleanUI() {
+    const existingButtons = document.querySelectorAll('.decensor-button');
+    existingButtons.forEach((button) => button.remove());
   }
 
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', init);
-  } else {
-    init();
-  }
+  loadConfig();
+
+  let debounceTimer = null;
+  csLib.PathElementListener('/scenes/', '.scene-toolbar', function () {
+    if (debounceTimer) clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(() => {
+      cleanUI();
+      injectButton();
+    }, 300);
+  });
 })();
