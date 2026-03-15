@@ -1,3 +1,4 @@
+from typing import Optional
 from fastapi import APIRouter, HTTPException
 
 from app.config import settings
@@ -43,7 +44,7 @@ async def create_job(request: JobCreateRequest):
 
 @router.get("", response_model=JobListResponse)
 async def list_jobs(
-    status: JobStatus = None,
+    status: Optional[JobStatus] = None,
     limit: int = 100,
     offset: int = 0,
 ):
