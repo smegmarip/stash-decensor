@@ -49,7 +49,12 @@ A dockerized web service that uses **lada** to decensor (restore pixelated) vide
    - Copy the `stash-plugin` folder to your Stash plugins directory
    - Reload plugins in Stash Settings > Plugins
 
-4. **Configure tags (optional):**
+4. **Configure plugin settings:**
+   - Go to Settings > Plugins > Decensor
+   - Set **Decensor API URL** to your API endpoint (e.g., `http://192.168.1.100:7030`)
+   - Note: Use your server's IP address, not `localhost`, if accessing Stash remotely
+
+5. **Configure tags (optional):**
    - Create "censored" and "decensored" tags in Stash
    - Add their IDs to `.env` for automatic tag management
 
@@ -104,6 +109,16 @@ Ports are customizable via `API_PORT` and `UI_PORT` environment variables.
 | `CACHE_TTL` | `86400` | Job retention in seconds |
 | `API_PORT` | `7030` | External port for API service |
 | `UI_PORT` | `7031` | External port for jobs viewer UI |
+
+### Plugin Settings
+
+Configure in Stash at Settings > Plugins > Decensor:
+
+| Setting | Description |
+|---------|-------------|
+| Decensor API URL | URL of the decensor API service (e.g., `http://192.168.1.100:7030`). Use your server's IP address if accessing Stash remotely. |
+| Censored Tag ID | Stash tag ID that marks scenes as censored. Only scenes with this tag will show the Decensor button. |
+| Decensored Tag ID | Stash tag ID to apply after successful decensoring. |
 
 ### Lada Encoding Presets
 
