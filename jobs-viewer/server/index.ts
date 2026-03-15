@@ -13,6 +13,7 @@ app.use('/decensor', createProxyMiddleware({
   target: API_URL,
   changeOrigin: true,
   ws: true,
+  pathRewrite: (path) => `/decensor${path}`,
 }))
 
 app.use(express.static(path.join(__dirname, '../dist')))
