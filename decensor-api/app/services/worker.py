@@ -1,5 +1,4 @@
 import asyncio
-import subprocess
 import re
 import os
 from datetime import datetime
@@ -56,15 +55,11 @@ class WorkerService:
         start_time = datetime.utcnow()
 
         try:
-            await queue_service.update_job_status(
-                job_id,
-                JobStatus.PROCESSING,
-                progress=0.0
-            )
+            await queue_service.update_job_status(job_id, JobStatus.PROCESSING, progress=0.0)
 
             output_path = self._get_output_path(job.video_path)
 
-            success = await self._run_lada(
+            success, error_message = await self._run_lada(
                 job_id=job_id,
                 input_path=job.video_path,
                 output_path=output_path,
@@ -72,30 +67,26 @@ class WorkerService:
                 max_clip_length=job.max_clip_length,
             )
 
+            # Verify output file exists before marking as successful
+            if success and not os.path.exists(output_path):
+                success = False
+                error_message = f"Output file was not created: {output_path}"
+
             if success:
                 elapsed = (datetime.utcnow() - start_time).total_seconds()
                 await queue_service.update_job_status(
                     job_id,
                     JobStatus.COMPLETED,
                     progress=1.0,
-                    result={
-                        "output_path": output_path,
-                        "processing_time_seconds": elapsed
-                    }
+                    result={"output_path": output_path, "processing_time_seconds": elapsed},
                 )
             else:
                 await queue_service.update_job_status(
-                    job_id,
-                    JobStatus.FAILED,
-                    error="Lada processing failed"
+                    job_id, JobStatus.FAILED, error=error_message or "Lada processing failed"
                 )
 
         except Exception as e:
-            await queue_service.update_job_status(
-                job_id,
-                JobStatus.FAILED,
-                error=str(e)
-            )
+            await queue_service.update_job_status(job_id, JobStatus.FAILED, error=str(e))
         finally:
             self._current_job_id = None
 
@@ -110,13 +101,26 @@ class WorkerService:
         output_path: str,
         encoding_preset: str,
         max_clip_length: Optional[int],
-    ) -> bool:
+    ) -> tuple[bool, Optional[str]]:
+        """
+        Run lada-cli to process the video.
+        Returns: (success: bool, error_message: Optional[str])
+        """
+        # Check if input file exists (in the container's mounted path)
+        if not os.path.exists(input_path):
+            raise FileNotFoundError(f"Input file not found: {input_path}")
+
         cmd = [
-            "docker", "exec", settings.worker_container,
+            "/usr/local/bin/docker",
+            "exec",
+            settings.worker_container,
             "lada-cli",
-            "--input", input_path,
-            "--output", output_path,
-            "--encoding-preset", encoding_preset,
+            "--input",
+            input_path,
+            "--output",
+            output_path,
+            "--encoding-preset",
+            encoding_preset,
         ]
 
         if max_clip_length is not None:
@@ -125,14 +129,21 @@ class WorkerService:
         if settings.fp16 is True:
             cmd.append("--fp16")
 
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-        )
+        print(f"[worker] Running command: {' '.join(cmd)}")
 
-        total_frames = None
-        current_frame = 0
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+        except FileNotFoundError as e:
+            raise FileNotFoundError(
+                f"Docker command not found. Ensure docker is installed and /var/run/docker.sock is mounted. Error: {e}"
+            )
+
+        error_lines = []
+        last_progress = 0
 
         while True:
             line = await process.stdout.readline()
@@ -140,34 +151,53 @@ class WorkerService:
                 break
 
             line_str = line.decode("utf-8", errors="replace").strip()
+            if not line_str:
+                continue
+
             print(f"[lada] {line_str}")
 
+            # Check for cancellation
             job = await queue_service.get_job(job_id)
             if job and job.status == JobStatus.CANCELLED:
                 process.terminate()
                 await process.wait()
-                return False
+                return False, "Job cancelled"
 
-            if match := re.search(r"Total frames:\s*(\d+)", line_str):
-                total_frames = int(match.group(1))
+            # Capture error messages
+            line_lower = line_str.lower()
+            if any(keyword in line_lower for keyword in ["error", "exception", "failed", "traceback"]):
+                error_lines.append(line_str)
 
-            if match := re.search(r"Processing frame\s*(\d+)", line_str):
-                current_frame = int(match.group(1))
+            # Parse progress from lada output format: "Processing video: XX%|"
+            if match := re.search(r"Processing video:\s*(\d+)%", line_str):
+                progress = int(match.group(1)) / 100.0
+                # Only update if progress has changed to reduce Redis writes
+                if progress > last_progress:
+                    last_progress = progress
+                    await queue_service.update_job_status(job_id, JobStatus.PROCESSING, progress=min(progress, 0.99))
 
-            if match := re.search(r"(\d+)/(\d+)", line_str):
+            # Also try frame-based progress patterns as fallback
+            elif match := re.search(r"(\d+)/(\d+)", line_str):
                 current_frame = int(match.group(1))
                 total_frames = int(match.group(2))
-
-            if total_frames and total_frames > 0:
-                progress = min(current_frame / total_frames, 0.99)
-                await queue_service.update_job_status(
-                    job_id,
-                    JobStatus.PROCESSING,
-                    progress=progress
-                )
+                if total_frames > 0:
+                    progress = current_frame / total_frames
+                    if progress > last_progress:
+                        last_progress = progress
+                        await queue_service.update_job_status(
+                            job_id, JobStatus.PROCESSING, progress=min(progress, 0.99)
+                        )
 
         await process.wait()
-        return process.returncode == 0
+
+        if process.returncode != 0:
+            error_message = (
+                "; ".join(error_lines[-5:]) if error_lines else f"Process exited with code {process.returncode}"
+            )
+            print(f"[worker] Lada failed with return code {process.returncode}: {error_message}")
+            return False, error_message
+
+        return True, None
 
     def is_processing(self, job_id: str) -> bool:
         return self._current_job_id == job_id

@@ -30,3 +30,7 @@ tasks:
     description: Decensor a pixelated video using AI
     defaultArgs:
       mode: decensor
+  - name: Merge Decensored Scene
+    description: Find and merge a decensored scene into the original
+    defaultArgs:
+      mode: merge

@@ -9,6 +9,85 @@
   const React = api.React;
   const { Button } = api.libraries.Bootstrap;
 
+  /**
+   * Waits for a Stash job to finish.
+   * @param {string} jobId - The job ID.
+   * @param {function} onProgress - Optional progress callback.
+   * @returns {Promise<boolean>} - Resolves true on success, rejects on failure.
+   */
+  async function awaitJobFinished(jobId, onProgress) {
+    return new Promise((resolve, reject) => {
+      const interval = setInterval(async () => {
+        const result = await getJobStatus(jobId);
+        const status = result.findJob?.status;
+        const progress = result.findJob?.progress;
+
+        if (typeof progress === 'number' && progress >= 0 && onProgress) {
+          onProgress(progress);
+        }
+
+        if (status === 'FINISHED') {
+          clearInterval(interval);
+          resolve(true);
+        } else if (status === 'FAILED') {
+          clearInterval(interval);
+          reject(new Error('Job failed'));
+        }
+      }, 500);
+    });
+  }
+
+  /**
+   * Polls Stash logs for a message with the given prefix.
+   * @param {string} prefix - The log message prefix to search for.
+   * @param {number} delay - Time offset in ms (negative to look back).
+   * @returns {Promise<string>} - The message content after the prefix.
+   */
+  async function pollLogsForMessage(prefix, delay = 0) {
+    const reqTime = Date.now() + delay;
+    const reqData = {
+      variables: {},
+      query: `query Logs {
+        logs {
+          time
+          level
+          message
+        }
+      }`,
+    };
+    await new Promise((r) => setTimeout(r, 500));
+    let retries = 0;
+    while (true) {
+      const pollDelay = 2 ** retries * 100;
+      await new Promise((r) => setTimeout(r, pollDelay));
+      retries++;
+
+      const logs = await csLib.callGQL(reqData);
+      for (const log of logs.logs) {
+        const logTime = Date.parse(log.time);
+        if (logTime > reqTime && log.message.startsWith(prefix)) {
+          return log.message.replace(prefix, '').trim();
+        }
+      }
+
+      if (retries >= 10) {
+        throw new Error(`Poll logs failed for message: ${prefix}`);
+      }
+    }
+  }
+
+  /**
+   * Refreshes the page data using Apollo client.
+   */
+  function refreshPage() {
+    try {
+      window.__APOLLO_CLIENT__.reFetchObservableQueries();
+    } catch (e) {
+      console.warn('[Decensor] Apollo refresh failed, reloading page');
+      window.location.reload();
+    }
+  }
+
   // Magic wand / restore icon
   const decensorIconSvg = `
 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
@@ -85,10 +164,12 @@
 
       const videoPath = scene.files[0].path;
       const sceneTitle = scene.title || `Scene ${sceneId}`;
+      activeJobs.set(sceneId, true);
 
       showToast(`Starting decensor job for: ${sceneTitle}`);
 
-      // Run the plugin task via RPC
+      // Run decensor task via RPC
+      // The RPC will: submit to decensor-api, poll, then queue scan and merge jobs
       const result = await runPluginTask(
         PLUGIN_ID,
         'Decensor Scene',
@@ -104,71 +185,54 @@
 
       if (!result || !result.runPluginTask) {
         showToast('Failed to start decensor task', 'error');
-        return;
-      }
-
-      const jobId = result.runPluginTask;
-      activeJobs.set(sceneId, jobId);
-
-      showToast(`Job queued: ${jobId}`);
-
-      // Poll for job completion
-      await pollJobCompletion(sceneId, jobId);
-
-    } catch (e) {
-      console.error('[Decensor] Error starting job:', e);
-      showToast(`Failed to start job: ${e.message}`, 'error');
-      activeJobs.delete(sceneId);
-      resetButton(sceneId);
-    }
-  }
-
-  async function pollJobCompletion(sceneId, jobId) {
-    const pollInterval = 2000;
-    const maxWaitMs = 7200000;
-    const startTime = Date.now();
-
-    const poll = async () => {
-      if (Date.now() - startTime > maxWaitMs) {
-        showToast('Job timed out', 'error');
         activeJobs.delete(sceneId);
         resetButton(sceneId);
         return;
       }
 
+      const jobId = result.runPluginTask;
+      console.log(`[Decensor] Job started: ${jobId}`);
+
+      // Wait for decensor job to complete
       try {
-        const result = await getJobStatus(jobId);
-        const status = result?.findJob?.status;
-        const progress = result?.findJob?.progress;
-
-        if (typeof progress === 'number' && progress >= 0) {
+        await awaitJobFinished(jobId, (progress) => {
           updateButtonProgress(sceneId, Math.round(progress * 100));
-        }
-
-        if (status === 'FINISHED') {
-          showToast('Decensoring complete!');
-          activeJobs.delete(sceneId);
-          resetButton(sceneId);
-          return;
-        }
-
-        if (status === 'FAILED' || status === 'CANCELLED') {
-          showToast(`Job ${status.toLowerCase()}`, 'error');
-          activeJobs.delete(sceneId);
-          resetButton(sceneId);
-          return;
-        }
-
-        // Continue polling
-        setTimeout(poll, pollInterval);
-
+        });
       } catch (e) {
-        console.error('[Decensor] Error polling job status:', e);
-        setTimeout(poll, pollInterval);
+        showToast(`Decensor failed: ${e.message}`, 'error');
+        activeJobs.delete(sceneId);
+        resetButton(sceneId);
+        return;
       }
-    };
 
-    poll();
+      // Decensor job queued scan and merge - poll for merge result
+      showToast('Decensoring complete! Waiting for scan and merge...');
+      updateButtonProgress(sceneId, 100);
+
+      try {
+        const mergePrefix = '[Plugin / Decensor] mergeResult=';
+        const resultJson = await pollLogsForMessage(mergePrefix, -5000);
+        const result = JSON.parse(resultJson);
+
+        if (result.success) {
+          showToast('Scene merged successfully!');
+          refreshPage();
+        }
+      } catch (e) {
+        console.warn('[Decensor] Failed to poll merge result:', e);
+        // Still show success since the jobs were queued
+        showToast('Decensoring queued. Refresh page when complete.');
+      }
+
+      activeJobs.delete(sceneId);
+      resetButton(sceneId);
+
+    } catch (e) {
+      console.error('[Decensor] Error:', e);
+      showToast(`Failed: ${e.message}`, 'error');
+      activeJobs.delete(sceneId);
+      resetButton(sceneId);
+    }
   }
 
   function updateButtonProgress(sceneId, percent) {

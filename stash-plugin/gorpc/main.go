@@ -40,11 +40,11 @@ type JobRequest struct {
 
 // JobResponse represents the response from submitting a job
 type JobResponse struct {
-	JobID       string   `json:"job_id"`
-	Status      string   `json:"status"`
-	Progress    float64  `json:"progress"`
-	Error       *string  `json:"error"`
-	Result      *Result  `json:"result"`
+	JobID    string  `json:"job_id"`
+	Status   string  `json:"status"`
+	Progress float64 `json:"progress"`
+	Error    *string `json:"error"`
+	Result   *Result `json:"result"`
 }
 
 // Result represents the job result
@@ -133,8 +133,10 @@ func (a *decensorAPI) Run(input common.PluginInput, output *common.PluginOutput)
 
 	switch mode {
 	case "decensor":
-		err = a.decensorScene(input)
-		outputStr = "Decensor job completed successfully"
+		outputStr, err = a.decensorScene(input)
+	case "merge":
+		err = a.mergeDecensoredScene(input)
+		outputStr = "Scenes merged successfully"
 	default:
 		err = fmt.Errorf("unknown mode: %s", mode)
 	}
@@ -154,8 +156,8 @@ func (a *decensorAPI) Run(input common.PluginInput, output *common.PluginOutput)
 	return nil
 }
 
-// decensorScene submits a decensor job and polls for completion
-func (a *decensorAPI) decensorScene(input common.PluginInput) error {
+// decensorScene submits a decensor job, polls for completion, then queues scan and merge jobs
+func (a *decensorAPI) decensorScene(input common.PluginInput) (string, error) {
 	sceneID := input.Args.String("scene_id")
 	videoPath := input.Args.String("video_path")
 	serviceURL := input.Args.String("service_url")
@@ -163,10 +165,10 @@ func (a *decensorAPI) decensorScene(input common.PluginInput) error {
 	decensoredTagID := input.Args.String("decensored_tag_id")
 
 	if sceneID == "" {
-		return fmt.Errorf("scene_id is required")
+		return "", fmt.Errorf("scene_id is required")
 	}
 	if videoPath == "" {
-		return fmt.Errorf("video_path is required")
+		return "", fmt.Errorf("video_path is required")
 	}
 
 	serviceURL = resolveServiceURL(serviceURL)
@@ -176,7 +178,7 @@ func (a *decensorAPI) decensorScene(input common.PluginInput) error {
 	// Submit job to decensor API
 	jobID, err := a.submitJob(serviceURL, videoPath, sceneID)
 	if err != nil {
-		return fmt.Errorf("failed to submit job: %w", err)
+		return "", fmt.Errorf("failed to submit job: %w", err)
 	}
 
 	log.Infof("Decensor job submitted: %s", jobID)
@@ -184,28 +186,71 @@ func (a *decensorAPI) decensorScene(input common.PluginInput) error {
 	// Poll for completion
 	result, err := a.pollJobStatus(serviceURL, jobID)
 	if err != nil {
-		return err
+		return "", err
 	}
 
 	log.Infof("Decensor job completed, output: %s", result.OutputPath)
 
-	// Scan the output file
-	if err := a.scanPath(result.OutputPath); err != nil {
-		log.Warnf("Failed to trigger metadata scan: %v", err)
+	// Queue metadata scan (runs after this plugin exits)
+	scanJobID, err := a.triggerMetadataScan(result.OutputPath)
+	if err != nil {
+		return "", fmt.Errorf("failed to trigger scan: %w", err)
+	}
+	log.Infof("Queued metadata scan job: %s", scanJobID)
+
+	// Queue merge task (runs after scan completes due to single worker queue)
+	mergeJobID, err := a.triggerMergeTask(sceneID, result.OutputPath, censoredTagID, decensoredTagID)
+	if err != nil {
+		return "", fmt.Errorf("failed to trigger merge: %w", err)
+	}
+	log.Infof("Queued merge job: %s", mergeJobID)
+
+	return result.OutputPath, nil
+}
+
+// mergeDecensoredScene finds the new scene by path and merges it into the original
+func (a *decensorAPI) mergeDecensoredScene(input common.PluginInput) error {
+	sceneID := input.Args.String("scene_id")
+	outputPath := input.Args.String("output_path")
+	censoredTagID := input.Args.String("censored_tag_id")
+	decensoredTagID := input.Args.String("decensored_tag_id")
+
+	if sceneID == "" {
+		return fmt.Errorf("scene_id is required")
+	}
+	if outputPath == "" {
+		return fmt.Errorf("output_path is required")
 	}
 
-	// Wait for scan to complete
-	time.Sleep(3 * time.Second)
+	log.Infof("Merging decensored scene for original %s, path: %s", sceneID, outputPath)
 
-	// Find the new scene
-	newSceneID, err := a.findSceneByPath(result.OutputPath)
+	// Find the new scene and its file ID
+	newSceneID, newFileID, err := a.findSceneAndFileByPath(outputPath)
 	if err != nil {
-		log.Warnf("Failed to find new scene: %v", err)
-	} else if newSceneID != "" && newSceneID != sceneID {
+		return fmt.Errorf("failed to find new scene: %w", err)
+	}
+
+	if newSceneID == "" {
+		return fmt.Errorf("no scene found for path: %s", outputPath)
+	}
+
+	if newSceneID == sceneID {
+		log.Infof("Scene already has the decensored file, skipping merge")
+	} else {
 		// Merge scenes
 		log.Infof("Merging scene %s into %s", newSceneID, sceneID)
 		if err := a.mergeScenes([]string{newSceneID}, sceneID); err != nil {
-			log.Warnf("Failed to merge scenes: %v", err)
+			return fmt.Errorf("failed to merge scenes: %w", err)
+		}
+		log.Infof("Scenes merged successfully")
+	}
+
+	// Set the decensored file as primary
+	if newFileID != "" {
+		if err := a.setPrimaryFile(sceneID, newFileID); err != nil {
+			log.Warnf("Failed to set primary file: %v", err)
+		} else {
+			log.Infof("Set decensored file as primary: %s", newFileID)
 		}
 	}
 
@@ -216,7 +261,67 @@ func (a *decensorAPI) decensorScene(input common.PluginInput) error {
 		}
 	}
 
+	// Log result for JS to poll
+	resultJSON := fmt.Sprintf(`{"success":true,"scene_id":"%s","output_path":"%s"}`, sceneID, outputPath)
+	log.Infof("mergeResult=%s", resultJSON)
+
 	return nil
+}
+
+func (a *decensorAPI) triggerMetadataScan(path string) (string, error) {
+	ctx := context.Background()
+
+	var mutation struct {
+		MetadataScan graphql.String `graphql:"metadataScan(input: $input)"`
+	}
+
+	type ScanMetadataInput struct {
+		Paths []string `json:"paths"`
+	}
+
+	variables := map[string]interface{}{
+		"input": ScanMetadataInput{Paths: []string{path}},
+	}
+
+	err := a.graphqlClient.Mutate(ctx, &mutation, variables)
+	if err != nil {
+		return "", fmt.Errorf("metadata scan mutation failed: %w", err)
+	}
+
+	return string(mutation.MetadataScan), nil
+}
+
+// Map represents a GraphQL Map scalar
+type Map map[string]interface{}
+
+func (a *decensorAPI) triggerMergeTask(sceneID, outputPath, censoredTagID, decensoredTagID string) (string, error) {
+	ctx := context.Background()
+
+	// Use args_map (newer approach) instead of deprecated args parameter
+	var mutation struct {
+		RunPluginTask graphql.ID `graphql:"runPluginTask(plugin_id: $pid, task_name: $tn, args_map: $am)"`
+	}
+
+	argsMap := &Map{
+		"mode":              "merge",
+		"scene_id":          sceneID,
+		"output_path":       outputPath,
+		"censored_tag_id":   censoredTagID,
+		"decensored_tag_id": decensoredTagID,
+	}
+
+	variables := map[string]interface{}{
+		"pid": graphql.ID("stash-decensor"),
+		"tn":  graphql.String("Merge Decensored Scene"),
+		"am":  argsMap,
+	}
+
+	err := a.graphqlClient.Mutate(ctx, &mutation, variables)
+	if err != nil {
+		return "", fmt.Errorf("run plugin task mutation failed: %w", err)
+	}
+
+	return string(mutation.RunPluginTask), nil
 }
 
 func (a *decensorAPI) submitJob(serviceURL, videoPath, sceneID string) (string, error) {
@@ -301,37 +406,17 @@ func (a *decensorAPI) pollJobStatus(serviceURL, jobID string) (*Result, error) {
 	}
 }
 
-func (a *decensorAPI) scanPath(path string) error {
-	ctx := context.Background()
-
-	var mutation struct {
-		MetadataScan graphql.String `graphql:"metadataScan(input: $input)"`
-	}
-
-	type ScanMetadataInput struct {
-		Paths []string `json:"paths"`
-	}
-
-	variables := map[string]interface{}{
-		"input": ScanMetadataInput{Paths: []string{path}},
-	}
-
-	err := a.graphqlClient.Mutate(ctx, &mutation, variables)
-	if err != nil {
-		return fmt.Errorf("metadata scan mutation failed: %w", err)
-	}
-
-	log.Infof("Triggered metadata scan for: %s", path)
-	return nil
-}
-
-func (a *decensorAPI) findSceneByPath(path string) (string, error) {
+func (a *decensorAPI) findSceneAndFileByPath(path string) (string, string, error) {
 	ctx := context.Background()
 
 	var query struct {
 		FindScenes struct {
 			Scenes []struct {
-				ID graphql.ID `graphql:"id"`
+				ID    graphql.ID `graphql:"id"`
+				Files []struct {
+					ID   graphql.ID     `graphql:"id"`
+					Path graphql.String `graphql:"path"`
+				} `graphql:"files"`
 			} `graphql:"scenes"`
 		} `graphql:"findScenes(filter: $filter, scene_filter: $scene_filter)"`
 	}
@@ -349,27 +434,75 @@ func (a *decensorAPI) findSceneByPath(path string) (string, error) {
 		Path *StringCriterionInput `json:"path"`
 	}
 
-	perPage := graphql.Int(1)
+	// Use INCLUDES for more flexible matching (handles path normalization differences)
+	perPage := graphql.Int(10)
 	variables := map[string]interface{}{
 		"filter": &FindFilterType{PerPage: &perPage},
 		"scene_filter": &SceneFilterType{
 			Path: &StringCriterionInput{
 				Value:    graphql.String(path),
-				Modifier: "EQUALS",
+				Modifier: "INCLUDES",
 			},
 		},
 	}
 
 	err := a.graphqlClient.Query(ctx, &query, variables)
 	if err != nil {
-		return "", fmt.Errorf("find scenes query failed: %w", err)
+		return "", "", fmt.Errorf("find scenes query failed: %w", err)
 	}
 
+	// Find exact match from results
+	for _, scene := range query.FindScenes.Scenes {
+		for _, file := range scene.Files {
+			if string(file.Path) == path {
+				log.Infof("Found scene %s with file %s matching path: %s", scene.ID, file.ID, path)
+				return string(scene.ID), string(file.ID), nil
+			}
+		}
+	}
+
+	// If no exact match, return first result if any
 	if len(query.FindScenes.Scenes) > 0 {
-		return string(query.FindScenes.Scenes[0].ID), nil
+		scene := query.FindScenes.Scenes[0]
+		fileID := ""
+		if len(scene.Files) > 0 {
+			fileID = string(scene.Files[0].ID)
+		}
+		log.Infof("No exact path match, using first result: %s", scene.ID)
+		return string(scene.ID), fileID, nil
 	}
 
-	return "", nil
+	log.Warnf("No scene found for path: %s", path)
+	return "", "", nil
+}
+
+func (a *decensorAPI) setPrimaryFile(sceneID, fileID string) error {
+	ctx := context.Background()
+
+	var mutation struct {
+		SceneUpdate struct {
+			ID graphql.ID `graphql:"id"`
+		} `graphql:"sceneUpdate(input: $input)"`
+	}
+
+	type SceneUpdateInput struct {
+		ID            graphql.ID `json:"id"`
+		PrimaryFileID graphql.ID `json:"primary_file_id"`
+	}
+
+	variables := map[string]interface{}{
+		"input": SceneUpdateInput{
+			ID:            graphql.ID(sceneID),
+			PrimaryFileID: graphql.ID(fileID),
+		},
+	}
+
+	err := a.graphqlClient.Mutate(ctx, &mutation, variables)
+	if err != nil {
+		return fmt.Errorf("set primary file mutation failed: %w", err)
+	}
+
+	return nil
 }
 
 func (a *decensorAPI) mergeScenes(sourceIDs []string, destID string) error {
