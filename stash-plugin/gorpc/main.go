@@ -243,14 +243,21 @@ func (a *decensorAPI) mergeDecensoredScene(input common.PluginInput) error {
 			return fmt.Errorf("failed to merge scenes: %w", err)
 		}
 		log.Infof("Scenes merged successfully")
-	}
 
-	// Set the decensored file as primary
-	if newFileID != "" {
-		if err := a.setPrimaryFile(sceneID, newFileID); err != nil {
-			log.Warnf("Failed to set primary file: %v", err)
+		// Set the decensored file as primary
+		if newFileID != "" {
+			if err := a.setPrimaryFile(sceneID, newFileID); err != nil {
+				log.Warnf("Failed to set primary file: %v", err)
+			} else {
+				log.Infof("Set decensored file as primary: %s", newFileID)
+			}
+		}
+
+		// Generate metadata for the new file (sprites, previews, etc.)
+		if err := a.triggerMetadataGenerate(sceneID); err != nil {
+			log.Warnf("Failed to trigger metadata generation: %v", err)
 		} else {
-			log.Infof("Set decensored file as primary: %s", newFileID)
+			log.Infof("Triggered metadata generation for scene: %s", sceneID)
 		}
 	}
 
@@ -289,6 +296,46 @@ func (a *decensorAPI) triggerMetadataScan(path string) (string, error) {
 	}
 
 	return string(mutation.MetadataScan), nil
+}
+
+func (a *decensorAPI) triggerMetadataGenerate(sceneID string) error {
+	ctx := context.Background()
+
+	var mutation struct {
+		MetadataGenerate graphql.String `graphql:"metadataGenerate(input: $input)"`
+	}
+
+	type GenerateMetadataInput struct {
+		SceneIDs      []string `json:"sceneIDs"`
+		Sprites       bool     `json:"sprites"`
+		Previews      bool     `json:"previews"`
+		ImagePreviews bool     `json:"imagePreviews"`
+		Markers       bool     `json:"markers"`
+		Transcodes    bool     `json:"transcodes"`
+		Covers        bool     `json:"covers"`
+		Overwrite     bool     `json:"overwrite"`
+	}
+
+	variables := map[string]interface{}{
+		"input": GenerateMetadataInput{
+			SceneIDs:      []string{sceneID},
+			Sprites:       true,
+			Previews:      true,
+			ImagePreviews: true,
+			Markers:       false,
+			Transcodes:    true,
+			Covers:        true,
+			Overwrite:     false,
+		},
+	}
+
+	err := a.graphqlClient.Mutate(ctx, &mutation, variables)
+	if err != nil {
+		return fmt.Errorf("metadata generate mutation failed: %w", err)
+	}
+
+	log.Infof("Metadata generation queued: %s", mutation.MetadataGenerate)
+	return nil
 }
 
 // Map represents a GraphQL Map scalar
@@ -434,14 +481,14 @@ func (a *decensorAPI) findSceneAndFileByPath(path string) (string, string, error
 		Path *StringCriterionInput `json:"path"`
 	}
 
-	// Use INCLUDES for more flexible matching (handles path normalization differences)
-	perPage := graphql.Int(10)
+	// Use EQUALS for exact path matching
+	perPage := graphql.Int(1)
 	variables := map[string]interface{}{
 		"filter": &FindFilterType{PerPage: &perPage},
 		"scene_filter": &SceneFilterType{
 			Path: &StringCriterionInput{
 				Value:    graphql.String(path),
-				Modifier: "INCLUDES",
+				Modifier: "EQUALS",
 			},
 		},
 	}
@@ -451,25 +498,17 @@ func (a *decensorAPI) findSceneAndFileByPath(path string) (string, string, error
 		return "", "", fmt.Errorf("find scenes query failed: %w", err)
 	}
 
-	// Find exact match from results
-	for _, scene := range query.FindScenes.Scenes {
+	// Return exact match if found
+	if len(query.FindScenes.Scenes) > 0 {
+		scene := query.FindScenes.Scenes[0]
 		for _, file := range scene.Files {
 			if string(file.Path) == path {
-				log.Infof("Found scene %s with file %s matching path: %s", scene.ID, file.ID, path)
+				log.Infof("Found scene %s with file %s for path: %s", scene.ID, file.ID, path)
 				return string(scene.ID), string(file.ID), nil
 			}
 		}
-	}
-
-	// If no exact match, return first result if any
-	if len(query.FindScenes.Scenes) > 0 {
-		scene := query.FindScenes.Scenes[0]
-		fileID := ""
-		if len(scene.Files) > 0 {
-			fileID = string(scene.Files[0].ID)
-		}
-		log.Infof("No exact path match, using first result: %s", scene.ID)
-		return string(scene.ID), fileID, nil
+		// Scene matched but file path doesn't - shouldn't happen with EQUALS
+		log.Warnf("Scene %s matched but no file has exact path: %s", scene.ID, path)
 	}
 
 	log.Warnf("No scene found for path: %s", path)

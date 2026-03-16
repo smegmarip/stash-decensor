@@ -132,10 +132,12 @@ class WorkerService:
         print(f"[worker] Running command: {' '.join(cmd)}")
 
         try:
+            # Use larger limit to handle tqdm output without newlines
             process = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
+                limit=4 * 1024 * 1024,  # 4MB buffer limit
             )
         except FileNotFoundError as e:
             raise FileNotFoundError(
@@ -144,49 +146,74 @@ class WorkerService:
 
         error_lines = []
         last_progress = 0
+        buffer = ""
 
         while True:
-            line = await process.stdout.readline()
-            if not line:
+            try:
+                # Read chunks instead of lines to handle tqdm carriage returns
+                chunk = await process.stdout.read(4096)
+                if not chunk:
+                    break
+
+                buffer += chunk.decode("utf-8", errors="replace")
+
+                # Process complete lines (split by newline or carriage return)
+                while "\n" in buffer or "\r" in buffer:
+                    # Find the first separator
+                    newline_pos = buffer.find("\n")
+                    cr_pos = buffer.find("\r")
+
+                    if newline_pos == -1:
+                        split_pos = cr_pos
+                    elif cr_pos == -1:
+                        split_pos = newline_pos
+                    else:
+                        split_pos = min(newline_pos, cr_pos)
+
+                    line_str = buffer[:split_pos].strip()
+                    buffer = buffer[split_pos + 1 :]
+
+                    if not line_str:
+                        continue
+
+                    print(f"[lada] {line_str}")
+
+                    # Capture error messages
+                    line_lower = line_str.lower()
+                    if any(keyword in line_lower for keyword in ["error", "exception", "failed", "traceback"]):
+                        error_lines.append(line_str)
+
+                    # Parse progress from lada output format: "Processing video: XX%|"
+                    if match := re.search(r"Processing video:\s*(\d+)%", line_str):
+                        progress = int(match.group(1)) / 100.0
+                        if progress > last_progress:
+                            last_progress = progress
+                            await queue_service.update_job_status(
+                                job_id, JobStatus.PROCESSING, progress=min(progress, 0.99)
+                            )
+
+                    # Also try frame-based progress patterns as fallback
+                    elif match := re.search(r"(\d+)/(\d+)", line_str):
+                        current_frame = int(match.group(1))
+                        total_frames = int(match.group(2))
+                        if total_frames > 0:
+                            progress = current_frame / total_frames
+                            if progress > last_progress:
+                                last_progress = progress
+                                await queue_service.update_job_status(
+                                    job_id, JobStatus.PROCESSING, progress=min(progress, 0.99)
+                                )
+
+                # Check for cancellation periodically
+                job = await queue_service.get_job(job_id)
+                if job and job.status == JobStatus.CANCELLED:
+                    process.terminate()
+                    await process.wait()
+                    return False, "Job cancelled"
+
+            except Exception as e:
+                print(f"[worker] Error reading output: {e}")
                 break
-
-            line_str = line.decode("utf-8", errors="replace").strip()
-            if not line_str:
-                continue
-
-            print(f"[lada] {line_str}")
-
-            # Check for cancellation
-            job = await queue_service.get_job(job_id)
-            if job and job.status == JobStatus.CANCELLED:
-                process.terminate()
-                await process.wait()
-                return False, "Job cancelled"
-
-            # Capture error messages
-            line_lower = line_str.lower()
-            if any(keyword in line_lower for keyword in ["error", "exception", "failed", "traceback"]):
-                error_lines.append(line_str)
-
-            # Parse progress from lada output format: "Processing video: XX%|"
-            if match := re.search(r"Processing video:\s*(\d+)%", line_str):
-                progress = int(match.group(1)) / 100.0
-                # Only update if progress has changed to reduce Redis writes
-                if progress > last_progress:
-                    last_progress = progress
-                    await queue_service.update_job_status(job_id, JobStatus.PROCESSING, progress=min(progress, 0.99))
-
-            # Also try frame-based progress patterns as fallback
-            elif match := re.search(r"(\d+)/(\d+)", line_str):
-                current_frame = int(match.group(1))
-                total_frames = int(match.group(2))
-                if total_frames > 0:
-                    progress = current_frame / total_frames
-                    if progress > last_progress:
-                        last_progress = progress
-                        await queue_service.update_job_status(
-                            job_id, JobStatus.PROCESSING, progress=min(progress, 0.99)
-                        )
 
         await process.wait()
 
