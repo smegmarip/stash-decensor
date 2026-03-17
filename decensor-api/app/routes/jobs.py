@@ -1,3 +1,4 @@
+import os
 from typing import Optional
 from fastapi import APIRouter, HTTPException
 
@@ -30,6 +31,13 @@ def job_to_response(job: Job) -> JobResponse:
 @router.post("", response_model=JobResponse)
 async def create_job(request: JobCreateRequest):
     """Submit a new decensor job."""
+    # Validate file exists before queueing
+    if not os.path.exists(request.video_path):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Video file not found: {request.video_path}"
+        )
+
     job = Job(
         video_path=request.video_path,
         scene_id=request.scene_id,
