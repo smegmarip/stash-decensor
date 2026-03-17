@@ -19,6 +19,10 @@ settings:
     displayName: Max Batch Size
     description: Maximum number of scenes to process in a batch (default 20)
     type: NUMBER
+  cooldownSeconds:
+    displayName: Cooldown Seconds
+    description: Seconds to wait between batch tasks to prevent hardware stress (default 10)
+    type: NUMBER
 ui:
   requires:
     - CommunityScriptsUILibrary

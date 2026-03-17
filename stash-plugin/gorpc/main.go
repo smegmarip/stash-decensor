@@ -170,6 +170,13 @@ func (a *decensorAPI) decensorScene(input common.PluginInput) (string, error) {
 	censoredTagID := input.Args.String("censored_tag_id")
 	decensoredTagID := input.Args.String("decensored_tag_id")
 
+	// Get cooldown setting from plugin config
+	pluginConfig, err := a.getPluginConfiguration()
+	if err != nil {
+		log.Warnf("Failed to get plugin configuration for cooldown: %v", err)
+	}
+	cooldownSeconds := getIntSetting(pluginConfig, "cooldownSeconds", 10)
+
 	if sceneID == "" {
 		return "", fmt.Errorf("scene_id is required")
 	}
@@ -216,6 +223,12 @@ func (a *decensorAPI) decensorScene(input common.PluginInput) (string, error) {
 		return "", fmt.Errorf("failed to trigger merge: %w", err)
 	}
 	log.Infof("Queued merge job: %s", mergeJobID)
+
+	// Apply cooldown period if specified (for batch processing)
+	if cooldownSeconds > 0 {
+		log.Infof("Cooling down for %d seconds to prevent hardware stress...", cooldownSeconds)
+		time.Sleep(time.Duration(cooldownSeconds) * time.Second)
+	}
 
 	return result.OutputPath, nil
 }
