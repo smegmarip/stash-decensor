@@ -15,6 +15,10 @@ settings:
     displayName: Decensored Tag ID
     description: Stash tag ID to apply after decensoring
     type: STRING
+  maxBatchSize:
+    displayName: Max Batch Size
+    description: Maximum number of scenes to process in a batch (default 20)
+    type: NUMBER
 ui:
   requires:
     - CommunityScriptsUILibrary
@@ -34,3 +38,7 @@ tasks:
     description: Find and merge a decensored scene into the original
     defaultArgs:
       mode: merge
+  - name: Batch Decensor
+    description: Decensor all scenes with the censored tag
+    defaultArgs:
+      mode: decensorBatch

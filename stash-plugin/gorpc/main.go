@@ -140,6 +140,9 @@ func (a *decensorAPI) Run(input common.PluginInput, output *common.PluginOutput)
 	case "merge":
 		err = a.mergeDecensoredScene(input)
 		outputStr = "Scenes merged successfully"
+	case "decensorBatch":
+		err = a.decensorBatch(input)
+		outputStr = "Batch decensor tasks queued successfully"
 	default:
 		err = fmt.Errorf("unknown mode: %s", mode)
 	}
@@ -755,4 +758,270 @@ func downloadFile(fileURL, destPath string) error {
 
 	_, err = io.Copy(outFile, resp.Body)
 	return err
+}
+
+// Types for batch processing
+type TagFragment struct {
+	ID   graphql.ID `graphql:"id"`
+	Name string     `graphql:"name"`
+}
+
+type VideoFile struct {
+	Path string `graphql:"path"`
+}
+
+type SceneForBatch struct {
+	ID    graphql.ID    `graphql:"id"`
+	Title *string       `graphql:"title"`
+	Files []VideoFile   `graphql:"files"`
+	Tags  []TagFragment `graphql:"tags"`
+}
+
+type FindScenesResult struct {
+	Count  graphql.Int
+	Scenes []SceneForBatch
+}
+
+type FindFilterType struct {
+	PerPage *graphql.Int `json:"per_page"`
+}
+
+type HierarchicalMultiCriterionInput struct {
+	Value    []graphql.String `json:"value"`
+	Modifier graphql.String   `json:"modifier"`
+	Depth    *graphql.Int     `json:"depth"`
+}
+
+type SceneFilterType struct {
+	Tags *HierarchicalMultiCriterionInput `json:"tags"`
+}
+
+// PluginConfig represents the plugin configuration
+type PluginConfig map[string]interface{}
+
+// PluginsConfiguration represents the plugins configuration result structure
+type PluginsConfiguration struct {
+	Plugins map[string]map[string]interface{} `json:"plugins"`
+}
+
+// getPluginConfiguration retrieves the plugin configuration from Stash
+func (a *decensorAPI) getPluginConfiguration() (PluginConfig, error) {
+	pluginName := "stash-decensor"
+	ctx := context.Background()
+
+	query := `query Configuration {
+		configuration {
+		plugins
+		}
+	}`
+
+	data, err := a.graphqlClient.ExecRaw(ctx, query, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query plugin configuration: %w", err)
+	}
+
+	var response struct {
+		Configuration PluginsConfiguration `json:"configuration"`
+	}
+
+	if err := json.Unmarshal(data, &response); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal plugin configuration: %w", err)
+	}
+
+	if pluginConfig, ok := response.Configuration.Plugins[pluginName]; ok {
+		return pluginConfig, nil
+	}
+
+	return nil, fmt.Errorf("plugin configuration not found for '%s'", pluginName)
+}
+
+// getStringSetting gets a string setting from plugin config
+func getStringSetting(config PluginConfig, key, defaultValue string) string {
+	if val, ok := config[key]; ok {
+		if s, ok := val.(string); ok && s != "" {
+			return s
+		}
+	}
+	return defaultValue
+}
+
+// getIntSetting gets an int setting from plugin config
+func getIntSetting(config PluginConfig, key string, defaultValue int) int {
+	if val, ok := config[key]; ok {
+		switch v := val.(type) {
+		case float64:
+			return int(v)
+		case int:
+			return v
+		}
+	}
+	return defaultValue
+}
+
+// decensorBatch finds all scenes with the censored tag and queues decensor tasks
+func (a *decensorAPI) decensorBatch(input common.PluginInput) error {
+	ctx := context.Background()
+
+	// Get plugin configuration
+	pluginConfig, err := a.getPluginConfiguration()
+	if err != nil {
+		return fmt.Errorf("failed to get plugin configuration: %w", err)
+	}
+
+	serviceURL := getStringSetting(pluginConfig, "decensorApiUrl", "")
+	censoredTagID := getStringSetting(pluginConfig, "censoredTagId", "")
+	decensoredTagID := getStringSetting(pluginConfig, "decensoredTagId", "")
+	maxBatchSize := getIntSetting(pluginConfig, "maxBatchSize", 20)
+
+	if censoredTagID == "" {
+		return fmt.Errorf("censoredTagId is required in plugin settings for batch processing")
+	}
+
+	log.Info("Starting batch decensor for all censored scenes...")
+	log.Infof("Configuration: maxBatchSize=%d, censoredTagID=%s, decensoredTagID=%s", maxBatchSize, censoredTagID, decensoredTagID)
+
+	// Find scenes with censored tag
+	scenes, err := a.findScenesWithTag(censoredTagID)
+	if err != nil {
+		return fmt.Errorf("failed to find censored scenes: %w", err)
+	}
+
+	log.Infof("Found %d scenes with censored tag", len(scenes))
+
+	// Filter out scenes that already have the decensored tag
+	scenesToProcess := []SceneForBatch{}
+	for _, scene := range scenes {
+		hasDecensoredTag := false
+		if decensoredTagID != "" {
+			for _, tag := range scene.Tags {
+				if string(tag.ID) == decensoredTagID {
+					hasDecensoredTag = true
+					break
+				}
+			}
+		}
+		if !hasDecensoredTag {
+			scenesToProcess = append(scenesToProcess, scene)
+		}
+	}
+
+	log.Infof("Filtered to %d scenes without decensored tag", len(scenesToProcess))
+
+	if len(scenesToProcess) == 0 {
+		log.Info("No scenes to process - all censored scenes already decensored!")
+		return nil
+	}
+
+	// Apply max batch size limit
+	if len(scenesToProcess) > maxBatchSize {
+		log.Warnf("Found %d scenes to process, but limiting to max_batch_size=%d", len(scenesToProcess), maxBatchSize)
+		scenesToProcess = scenesToProcess[:maxBatchSize]
+	}
+
+	// Queue decensor task for each scene
+	log.Infof("Queueing %d scenes for decensor...", len(scenesToProcess))
+
+	queued := 0
+	failed := 0
+
+	for _, scene := range scenesToProcess {
+		sceneTitle := "Unknown"
+		if scene.Title != nil {
+			sceneTitle = *scene.Title
+		}
+
+		if len(scene.Files) == 0 {
+			log.Warnf("Scene %s (%s): No video files found, skipping", string(scene.ID), sceneTitle)
+			failed++
+			continue
+		}
+
+		videoPath := scene.Files[0].Path
+
+		// Queue the task via RunPluginTask
+		// Note: Worker will resolve paths with encoding issues via glob fallback
+		_, err := a.queueDecensorTask(ctx, string(scene.ID), videoPath, serviceURL, censoredTagID, decensoredTagID)
+		if err != nil {
+			log.Errorf("Scene %s (%s): Failed to queue task: %v", string(scene.ID), sceneTitle, err)
+			failed++
+		} else {
+			log.Infof("Scene %s (%s): Queued for decensor", string(scene.ID), sceneTitle)
+			queued++
+		}
+	}
+
+	log.Infof("Batch processing complete: %d tasks queued, %d failed", queued, failed)
+
+	return nil
+}
+
+// findScenesWithTag queries scenes that have the specified tag
+func (a *decensorAPI) findScenesWithTag(tagID string) ([]SceneForBatch, error) {
+	ctx := context.Background()
+
+	var query struct {
+		FindScenes FindScenesResult `graphql:"findScenes(filter: $f, scene_filter: $sf)"`
+	}
+
+	perPage := graphql.Int(5000)
+	filterInput := &FindFilterType{
+		PerPage: &perPage,
+	}
+
+	depth := graphql.Int(-1)
+	tagsInput := &HierarchicalMultiCriterionInput{
+		Value:    []graphql.String{graphql.String(tagID)},
+		Modifier: "INCLUDES",
+		Depth:    &depth,
+	}
+	sceneFilterInput := &SceneFilterType{
+		Tags: tagsInput,
+	}
+
+	variables := map[string]interface{}{
+		"f":  filterInput,
+		"sf": sceneFilterInput,
+	}
+
+	err := a.graphqlClient.Query(ctx, &query, variables)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query scenes: %w", err)
+	}
+
+	log.Debugf("FindScenes returned %d scenes", len(query.FindScenes.Scenes))
+
+	return query.FindScenes.Scenes, nil
+}
+
+// queueDecensorTask queues a decensor task for a scene
+func (a *decensorAPI) queueDecensorTask(ctx context.Context, sceneID, videoPath, serviceURL, censoredTagID, decensoredTagID string) (string, error) {
+	var mutation struct {
+		RunPluginTask graphql.ID `graphql:"runPluginTask(plugin_id: $pid, task_name: $tn, description: $desc, args_map: $am)"`
+	}
+
+	argsMap := &Map{
+		"mode":              "decensor",
+		"scene_id":          sceneID,
+		"video_path":        videoPath,
+		"service_url":       serviceURL,
+		"censored_tag_id":   censoredTagID,
+		"decensored_tag_id": decensoredTagID,
+	}
+
+	variables := map[string]interface{}{
+		"pid":  graphql.ID("stash-decensor"),
+		"tn":   graphql.String("Decensor Scene"),
+		"desc": graphql.String(fmt.Sprintf("Decensoring %s", videoPath)),
+		"am":   argsMap,
+	}
+
+	err := a.graphqlClient.Mutate(ctx, &mutation, variables)
+	if err != nil {
+		return "", fmt.Errorf("failed to run plugin task: %w", err)
+	}
+
+	jobID := string(mutation.RunPluginTask)
+	log.Debugf("Queued job ID: %s", jobID)
+
+	return jobID, nil
 }
