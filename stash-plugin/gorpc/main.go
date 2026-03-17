@@ -9,6 +9,9 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
 	graphql "github.com/hasura/go-graphql-client"
@@ -191,8 +194,14 @@ func (a *decensorAPI) decensorScene(input common.PluginInput) (string, error) {
 
 	log.Infof("Decensor job completed, output: %s", result.OutputPath)
 
-	// Queue metadata scan (runs after this plugin exits)
-	scanJobID, err := a.triggerMetadataScan(result.OutputPath)
+	// Download captions from Stash API and save for new file (before scan so they get picked up)
+	if _, err := a.copyCaptions(sceneID, result.OutputPath); err != nil {
+		log.Warnf("Failed to copy captions: %v", err)
+	}
+
+	// Queue metadata scan on directory to pick up video and caption files
+	scanDir := filepath.Dir(result.OutputPath)
+	scanJobID, err := a.triggerMetadataScan(scanDir)
 	if err != nil {
 		return "", fmt.Errorf("failed to trigger scan: %w", err)
 	}
@@ -251,6 +260,14 @@ func (a *decensorAPI) mergeDecensoredScene(input common.PluginInput) error {
 			} else {
 				log.Infof("Set decensored file as primary: %s", newFileID)
 			}
+		}
+
+		// Re-scan the directory to associate caption with merged scene
+		scanDir := filepath.Dir(outputPath)
+		if _, err := a.triggerMetadataScan(scanDir); err != nil {
+			log.Warnf("Failed to trigger post-merge scan: %v", err)
+		} else {
+			log.Infof("Triggered post-merge scan for caption association")
 		}
 
 		// Generate metadata for the new file (sprites, previews, etc.)
@@ -646,4 +663,96 @@ func (a *decensorAPI) updateSceneTags(sceneID, censoredTagID, decensoredTagID st
 
 	log.Infof("Scene tags updated")
 	return nil
+}
+
+// copyCaptions downloads captions from the Stash API and saves them for the new video file
+// Returns the list of caption file paths that were created
+func (a *decensorAPI) copyCaptions(sceneID, newVideoPath string) ([]string, error) {
+	ctx := context.Background()
+
+	var query struct {
+		FindScene struct {
+			Captions []struct {
+				LanguageCode graphql.String `graphql:"language_code"`
+				CaptionType  graphql.String `graphql:"caption_type"`
+			} `graphql:"captions"`
+			Paths struct {
+				Caption graphql.String `graphql:"caption"`
+			} `graphql:"paths"`
+		} `graphql:"findScene(id: $id)"`
+	}
+
+	variables := map[string]interface{}{
+		"id": graphql.ID(sceneID),
+	}
+
+	err := a.graphqlClient.Query(ctx, &query, variables)
+	if err != nil {
+		return nil, fmt.Errorf("find scene query failed: %w", err)
+	}
+
+	if len(query.FindScene.Captions) == 0 {
+		log.Infof("No captions found for scene %s", sceneID)
+		return nil, nil
+	}
+
+	captionBaseURL := string(query.FindScene.Paths.Caption)
+	if captionBaseURL == "" {
+		log.Infof("No caption URL for scene %s", sceneID)
+		return nil, nil
+	}
+
+	newExt := filepath.Ext(newVideoPath)
+	newBase := strings.TrimSuffix(newVideoPath, newExt)
+
+	var captionFiles []string
+
+	for _, caption := range query.FindScene.Captions {
+		langCode := string(caption.LanguageCode)
+		captionType := string(caption.CaptionType)
+
+		// Download from Stash API: paths.caption?lang=XX&type=srt
+		downloadURL := fmt.Sprintf("%s?lang=%s&type=%s", captionBaseURL, langCode, captionType)
+
+		// Build destination filename
+		var dstPath string
+		if langCode == "" || langCode == "00" {
+			dstPath = newBase + "." + captionType
+		} else {
+			dstPath = fmt.Sprintf("%s.%s.%s", newBase, langCode, captionType)
+		}
+
+		// Download and save
+		if err := downloadFile(downloadURL, dstPath); err != nil {
+			log.Warnf("Failed to download caption %s: %v", downloadURL, err)
+			continue
+		}
+
+		log.Infof("Downloaded caption: %s -> %s", downloadURL, dstPath)
+		captionFiles = append(captionFiles, dstPath)
+	}
+
+	return captionFiles, nil
+}
+
+// downloadFile downloads a file from a URL and saves it to disk
+func downloadFile(fileURL, destPath string) error {
+	resp, err := http.Get(fileURL)
+	if err != nil {
+		return fmt.Errorf("failed to download: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+
+	outFile, err := os.Create(destPath)
+	if err != nil {
+		return fmt.Errorf("failed to create file: %w", err)
+	}
+	defer outFile.Close()
+
+	_, err = io.Copy(outFile, resp.Body)
+	return err
 }
