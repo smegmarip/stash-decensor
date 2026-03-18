@@ -57,7 +57,7 @@ class WorkerService:
         try:
             await queue_service.update_job_status(job_id, JobStatus.PROCESSING, progress=0.0)
 
-            output_path = self._get_output_path(job.video_path)
+            output_path = self._get_output_path(job.video_path, job.encoding_preset)
 
             success, error_message = await self._run_lada(
                 job_id=job_id,
@@ -90,8 +90,11 @@ class WorkerService:
         finally:
             self._current_job_id = None
 
-    def _get_output_path(self, input_path: str) -> str:
+    def _get_output_path(self, input_path: str, encoding_preset: str) -> str:
         base, ext = os.path.splitext(input_path)
+        # Force .mp4 extension for codecs that require an mp4 container
+        if "hevc" in encoding_preset or "h264" in encoding_preset:
+            ext = ".mp4"
         return f"{base}.restored{ext}"
 
     async def _run_lada(
