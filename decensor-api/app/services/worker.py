@@ -91,11 +91,17 @@ class WorkerService:
             self._current_job_id = None
 
     def _get_output_path(self, input_path: str, encoding_preset: str) -> str:
-        base, ext = os.path.splitext(input_path)
+        directory = os.path.dirname(input_path)
+        base = os.path.splitext(os.path.basename(input_path))[0]
         # Force .mp4 extension for codecs that require an mp4 container
+        ext = os.path.splitext(input_path)[1]
         if "hevc" in encoding_preset or "h264" in encoding_preset:
             ext = ".mp4"
-        return f"{base}.restored{ext}"
+        # Sanitize filename: replace non-alphanumeric chars (except dots, hyphens) with underscores
+        sanitized = re.sub(r'[^\w.\-]', '_', f"{base}.restored")
+        # Collapse multiple underscores
+        sanitized = re.sub(r'_+', '_', sanitized)
+        return os.path.join(directory, f"{sanitized}{ext}")
 
     async def _run_lada(
         self,
