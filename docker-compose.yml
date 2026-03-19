@@ -37,6 +37,8 @@ services:
     image: ladaapp/lada:latest
     container_name: decensor-worker
     runtime: nvidia
+    environment:
+      - PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-}
     deploy:
       resources:
         reservations:
