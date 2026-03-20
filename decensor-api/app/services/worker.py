@@ -130,6 +130,8 @@ class WorkerService:
             output_path,
             "--encoding-preset",
             encoding_preset,
+            "--mosaic-detection-model",
+            settings.mosaic_detection_model,
         ]
 
         if max_clip_length is not None:

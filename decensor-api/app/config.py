@@ -12,6 +12,7 @@ class Settings(BaseSettings):
     decensored_tag_id: str = ""
 
     encoding_preset: str = "hevc-nvidia-gpu-hq"
+    mosaic_detection_model: str = "v2"
     max_clip_length: Optional[int] = None
     fp16: Optional[bool] = None
 
