@@ -1,4 +1,5 @@
 name: Decensor
+# requires: CommunityScriptsUILibrary
 description: Decensor pixelated videos using AI
 version: 1.0.0
 url: https://github.com/smegmarip/stash-decensor
