@@ -1,0 +1,4 @@
+[submodule "stash-plugin"]
+	path = stash-plugin
+	url = https://github.com/smegmarip/stash-decensor-plugin.git
+	branch = main
