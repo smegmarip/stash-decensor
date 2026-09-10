@@ -1,7 +1,7 @@
 name: Decensor
 description: Decensor pixelated videos using AI
 version: 1.0.0
-url: https://github.com/yourusername/stash-decensor
+url: https://github.com/smegmarip/stash-decensor
 settings:
   decensorApiUrl:
     displayName: Decensor API URL
